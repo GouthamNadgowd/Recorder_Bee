@@ -1,0 +1,9 @@
+# Ignore PyInstaller build outputs
+build/
+dist/
+*.spec
+__pycache__/
+
+# Ignore temporary recording outputs
+temp_video_*.mp4
+temp_audio_*.wav
