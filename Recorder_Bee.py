@@ -1,9 +1,11 @@
 """
-Compact Screen Recorder Pro
+Recorder_Bee
 Description: A high-performance, lightweight Windows screen recording app with a 
              floating, invisible-to-video dashboard control layout, multi-mode capture presets,
              and navigation safety boundaries (Go-Back mechanisms).
-Author: Bhoomika M, Goutham N
+             Features dynamic Intel QSV / NVIDIA NVENC hardware acceleration routing
+             and an interactive click-and-drag custom region canvas selector.
+Authors: Bhoomika M, Goutham N
 License: Open Source / MIT
 """
 
@@ -19,10 +21,9 @@ import time
 import ffmpeg
 import os
 import sys
+import subprocess
 import tkinter as tk
 from tkinter import ttk
-# FROM PLYER IMPORT NOTIFICATION IS COMMENTED FOR LATER USE:
-# from plyer import notification 
 import ctypes  
 import ctypes.wintypes
 
@@ -56,11 +57,24 @@ temp_audio = ""
 final_output = ""
 
 # ==========================================
+# HARDWARE ACCELERATION AUTO-DETECTION ENGINE
+# ==========================================
+def get_gpu_type():
+    """Scans the Windows hardware layer using modern PowerShell CIM queries 
+    to check for dedicated NVIDIA graphics chips (Fixes old WMIC deprecation issues)."""
+    try:
+        cmd = ["powershell", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"]
+        output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
+        if "NVIDIA" in output.upper():
+            return "NVIDIA"
+    except Exception:
+        pass
+    return "INTEL" # Default fallback to Intel Iris Xe / Integrated layout architecture
+
+# ==========================================
 # ADVANCED ACTIVE WINDOW ENUMERATOR POPUP
 # ==========================================
 class WindowTargetPicker:
-    """Enumerates open system windows via the Windows user32 library and 
-    displays an interactive GUI menu for target application selection."""
     def __init__(self, parent, on_selection_callback):
         self.parent = parent
         self.on_selection_callback = on_selection_callback
@@ -75,7 +89,6 @@ class WindowTargetPicker:
         label = tk.Label(self.picker_win, text="Select an active window from the list:", font=("Segoe UI", 11, "bold"), fg="#ffffff", bg="#1e1e1e")
         label.pack(pady=12)
 
-        # Build list containment scroll frame
         list_frame = tk.Frame(self.picker_win, bg="#1e1e1e")
         list_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
 
@@ -89,11 +102,9 @@ class WindowTargetPicker:
         btn_frame = tk.Frame(self.picker_win, bg="#1e1e1e")
         btn_frame.pack(fill=tk.X, pady=15)
 
-        # Confirm target action
         self.select_btn = tk.Button(btn_frame, text="✔️ Confirm Target", font=("Segoe UI", 10, "bold"), fg="#ffffff", bg="#d32f2f", border=0, width=18, height=2, cursor="hand2", command=self.submit_target)
         self.select_btn.pack(side=tk.LEFT, padx=15)
 
-        # Go-back button to return back to main configuration panel safely
         self.back_btn = tk.Button(btn_frame, text="⬅️ Back to Menu", font=("Segoe UI", 10, "bold"), fg="#ffffff", bg="#555555", border=0, width=16, height=2, cursor="hand2", command=self.close_picker)
         self.back_btn.pack(side=tk.RIGHT, padx=15)
 
@@ -111,7 +122,7 @@ class WindowTargetPicker:
                     ctypes.windll.user32.GetWindowTextW(hwnd, buffer, length + 1)
                     title = buffer.value
                     
-                    if title not in ["Settings", "Program Manager", "Compact Screen Recorder Pro"] and not title.strip() == "":
+                    if title not in ["Settings", "Program Manager", "Recorder_Bee"] and not title.strip() == "":
                         display_string = f"▪️ {title}"
                         self.listbox.insert(tk.END, display_string)
                         self.window_map[display_string] = hwnd
@@ -153,54 +164,63 @@ class WindowTargetPicker:
         self.picker_win.destroy()
         self.on_selection_callback(None)
 
-
 # ==========================================
-# ADVANCED REGION SELECTOR (HOLLOW FRAME)
+# ADVANCED CLICK-AND-DRAG REGION SELECTOR
 # ==========================================
 class FloatingRegionSelector:
     def __init__(self, parent, on_confirm_callback):
         self.parent = parent
         self.on_confirm_callback = on_confirm_callback
         
+        # Create a borderless, full-screen overlay canvas cover
         self.win = tk.Toplevel(parent)
-        self.win.title("Drag & Position This Box To Record")
-        self.win.geometry("800x600+400+200")
-        self.win.configure(bg="#1e1e1e")
+        self.win.attributes("-fullscreen", True)
         self.win.attributes("-topmost", True)
-        self.win.wm_attributes("-transparentcolor", "#1e1e1e")
+        self.win.configure(bg="black")
         
-        self.border_frame = tk.Frame(self.win, highlightbackground="red", highlightcolor="red", highlightthickness=4, bg="#1e1e1e")
-        self.border_frame.pack(fill="both", expand=True)
+        # Make the overlay semi-transparent (Dim back mask effect)
+        self.win.attributes("-alpha", 0.35)
+        self.win.config(cursor="crosshair")
 
-        # Bottom control confirmation banner inside the hollow zone
-        self.control_bar = tk.Frame(self.border_frame, bg="red", height=40)
-        self.control_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.control_bar.pack_propagate(False)
+        self.canvas = tk.Canvas(self.win, cursor="crosshair", bg="grey", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
-        # Confirm target area metrics
-        self.btn = tk.Button(self.control_bar, text="✔️ Lock Area & Start Recording", font=("Segoe UI", 9, "bold"), fg="red", bg="white", activebackground="#eeeeee", command=self.confirm_and_close, border=0, padx=10)
-        self.btn.pack(side=tk.LEFT, padx=20, pady=5)
+        self.start_x = None
+        self.start_y = None
+        self.rect_id = None
 
-        # Cancel and return button right on the red crop banner layer
-        self.cancel_btn = tk.Button(self.control_bar, text="❌ Cancel & Go Back", font=("Segoe UI", 9, "bold"), fg="white", bg="#333333", activebackground="#444444", command=self.on_cancel, border=0, padx=10)
-        self.cancel_btn.pack(side=tk.RIGHT, padx=20, pady=5)
-
-        self.win.protocol("WM_DELETE_WINDOW", self.on_cancel)
-
-    def confirm_and_close(self):
-        self.win.update_idletasks()
+        # Bind mouse events for dragging functionality
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_move_press)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
         
-        x = self.win.winfo_x() + 4   
-        y = self.win.winfo_y() + 4
-        w = self.win.winfo_width() - 8
-        h = self.win.winfo_height() - 48 # Trim out the bottom banner layout size
+        # Bind Escape key to back out safely
+        self.win.bind("<Escape>", lambda event: self.on_cancel())
 
-        if w % 2 != 0: w -= 1
-        if h % 2 != 0: h -= 1
+    def on_button_press(self, event):
+        self.start_x = event.x
+        self.start_y = event.y
+        self.rect_id = self.canvas.create_rectangle(self.start_x, self.start_y, self.start_x, self.start_y, outline="red", width=3)
+
+    def on_move_press(self, event):
+        cur_x, cur_y = event.x, event.y
+        self.canvas.coords(self.rect_id, self.start_x, self.start_y, cur_x, cur_y)
+
+    def on_button_release(self, event):
+        end_x, end_y = event.x, event.y
+
+        left = min(self.start_x, end_x)
+        top = min(self.start_y, end_y)
+        width = abs(self.start_x - end_x)
+        height = abs(self.start_y - end_y)
+
+        # Enforce strict even resolutions for FFmpeg codec rendering
+        if width % 2 != 0: width -= 1
+        if height % 2 != 0: height -= 1
 
         coords = None
-        if w > 40 and h > 40:
-            coords = {"top": y, "left": x, "width": w, "height": h}
+        if width > 40 and height > 40:
+            coords = {"top": top, "left": left, "width": width, "height": height}
             
         self.win.destroy()
         self.on_confirm_callback(coords)
@@ -332,27 +352,48 @@ def record_video(t_video, target_w, target_h, current_fps, capture_box):
         video_writer.release()
 
 # ==========================================
-# BACKGROUND MULTITHREADED COMPRESSION PIPELINE
+# BACKGROUND HARDWARE-ACCELERATED MERGE ENGINE
 # ==========================================
 def post_process_and_merge(t_video, t_audio, f_out, chosen_crf):
-    update_status(f"Squeezing data into MP4 (Using CRF {chosen_crf})...")
+    gpu_engine = get_gpu_type()
     
-    # COMMENTED FOR LATER USE:
-    # notification.notify(title="Screen Recorder", message="Processing and compressing video...", timeout=2)
+    if gpu_engine == "NVIDIA":
+        update_status("⚡ Processing via NVIDIA NVENC (RTX 3050 Hard Engine)...")
+    else:
+        update_status("⚡ Processing via Intel QSV (Iris Xe Hard Engine)...")
     
     if t_audio.exists() and os.path.getsize(t_audio) > 10000:
         try:
             video_input = ffmpeg.input(str(t_video))
             audio_input = ffmpeg.input(str(t_audio))
-            ffmpeg.output(video_input, audio_input, str(f_out), vcodec='libx264', acodec='aac', pix_fmt='yuv420p', crf=chosen_crf, preset='ultrafast').run(quiet=True, overwrite_output=True)
-            os.remove(t_video); os.remove(t_audio)
-            update_status("✨ Done! Saved to Videos folder.")
             
-            # COMMENTED FOR LATER USE:
-            # notification.notify(title="Screen Recorder", message="Video optimized successfully!", timeout=3)
+            if gpu_engine == "NVIDIA":
+                # HP Victus Configuration Loop
+                ffmpeg.output(
+                    video_input, audio_input, str(f_out), 
+                    vcodec='h264_nvenc',
+                    cq=chosen_crf, 
+                    acodec='aac', 
+                    pix_fmt='yuv420p',
+                    preset='p7'
+                ).run(quiet=True, overwrite_output=True)
+            else:
+                # HP Pavilion Configuration Loop
+                ffmpeg.output(
+                    video_input, audio_input, str(f_out), 
+                    vcodec='h264_qsv',
+                    global_quality=chosen_crf, 
+                    acodec='aac', 
+                    pix_fmt='nv12',
+                    preset='veryslow'
+                ).run(quiet=True, overwrite_output=True)
+                
+            os.remove(t_video); os.remove(t_audio)
+            update_status("✨ Done! Saved to Videos folder via GPU acceleration.")
             
         except Exception as e:
-            update_status(f"❌ Compression failed: {e}")
+            update_status(f"❌ GPU Pipeline breakdown: {e}")
+            print(f"Error Diagnostic Dump: {e}")
     else:
         if t_video.exists(): os.remove(t_video)
         if t_audio.exists(): os.remove(t_audio)
@@ -390,9 +431,9 @@ def update_timer():
 
 def on_slider_move(val):
     v = int(float(val))
-    if v <= 21: crf_hint.config(text=f"CRF: {v} (Ultra Sharp Text)")
-    elif v <= 25: crf_hint.config(text=f"CRF: {v} (Best Balanced Profile)")
-    else: crf_hint.config(text=f"CRF: {v} (Extreme Space Saver)")
+    if v <= 21: crf_hint.config(text=f"Quality Index: {v} (Ultra Crisp Focus)")
+    elif v <= 25: crf_hint.config(text=f"Quality Index: {v} (Optimized Hardware Balanced)")
+    else: crf_hint.config(text=f"Quality Index: {v} (High Compression File Saver)")
 
 def toggle_pause():
     global paused, session_start_time, total_recorded_time
@@ -413,7 +454,6 @@ def execute_capture_initialization(chosen_box):
     global temp_video, temp_audio, final_output
 
     if not chosen_box:
-        # Handled safety back routing
         root.deiconify()
         update_status("🔄 Returned. Adjusted configuration settings.")
         return
@@ -430,7 +470,7 @@ def execute_capture_initialization(chosen_box):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     temp_video = videos_folder / f"temp_video_{timestamp}.mp4"
     temp_audio = videos_folder / f"temp_audio_{timestamp}.wav"
-    final_output = videos_folder / f"compressed_recording_{timestamp}.mp4"
+    final_output = videos_folder / f"RecorderBee_{timestamp}.mp4"
 
     root.deiconify()
     root.attributes("-topmost", True)  
@@ -441,9 +481,6 @@ def execute_capture_initialization(chosen_box):
     fps_dropdown.config(state="disabled"); mode_dropdown.config(state="disabled"); crf_slider.config(state="disabled")
     
     update_status("Recording! UI is pinned floating & invisible.")
-    
-    # COMMENTED FOR LATER USE:
-    # notification.notify(title="Screen Recorder", message="Recording Started!", timeout=2)
 
     audio_thread = threading.Thread(target=record_system_audio, args=(temp_audio,), daemon=True)
     video_thread = threading.Thread(target=record_video, args=(temp_video, width, height, chosen_fps, chosen_box), daemon=True)
@@ -471,12 +508,12 @@ def toggle_recording():
             
         else: # "🎯 Custom Region Select"
             root.withdraw()
-            time.sleep(0.1)
+            time.sleep(0.2)  # Generous buffer layout to let root window disappear cleanly
             FloatingRegionSelector(root, execute_capture_initialization)
     else:
         recording = False
         paused = False
-        record_btn.config(text="Processing...", state="disabled", bg="#777777")
+        record_btn.config(text="GPU Processing...", state="disabled", bg="#777777")
         pause_btn.config(state="disabled", text="⏸️ Pause", bg="#555555")
         
         if video_thread: video_thread.join()
@@ -490,7 +527,7 @@ def toggle_recording():
 # GRAPHICAL WINDOW SETUP (TKINTER)
 # ==========================================
 root = tk.Tk()
-root.title("Compact Screen Recorder Pro")
+root.title("Recorder_Bee") 
 root.geometry("460x360")
 root.resizable(False, False)
 root.configure(bg="#1e1e1e")
@@ -498,7 +535,7 @@ root.configure(bg="#1e1e1e")
 style = ttk.Style()
 style.theme_use('clam')
 
-title_label = tk.Label(root, text="🎥 Compact Screen Recorder Pro", font=("Segoe UI", 13, "bold"), fg="#ffffff", bg="#1e1e1e")
+title_label = tk.Label(root, text="🐝 Recorder_Bee Pro", font=("Segoe UI", 13, "bold"), fg="#ffffff", bg="#1e1e1e")
 title_label.pack(pady=10)
 
 frame_mode = tk.Frame(root, bg="#1e1e1e")
@@ -521,13 +558,13 @@ fps_dropdown.current(1)
 
 frame_crf = tk.Frame(root, bg="#1e1e1e")
 frame_crf.pack(pady=4)
-crf_label = tk.Label(frame_crf, text="Video Quality:", font=("Segoe UI", 10), fg="#bbbbbb", bg="#1e1e1e", width=12, anchor="w")
+crf_label = tk.Label(frame_crf, text="Hardware Quality:", font=("Segoe UI", 10), fg="#bbbbbb", bg="#1e1e1e", width=12, anchor="w")
 crf_label.pack(side=tk.LEFT, padx=5)
 crf_slider = tk.Scale(frame_crf, from_=18, to=32, orient=tk.HORIZONTAL, showvalue=False, bg="#1e1e1e", fg="#ffffff", highlightthickness=0, troughcolor="#333333", activebackground="#d32f2f", length=200, command=on_slider_move)
-crf_slider.set(22) 
+crf_slider.set(23) 
 crf_slider.pack(side=tk.LEFT, padx=5)
 
-crf_hint = tk.Label(root, text="CRF: 22 (Best Balanced Profile)", font=("Segoe UI", 9, "bold"), fg="#ff9100", bg="#1e1e1e")
+crf_hint = tk.Label(root, text="Quality Index: 23 (Optimized Hardware Balanced)", font=("Segoe UI", 9, "bold"), fg="#ff9100", bg="#1e1e1e")
 crf_hint.pack(pady=2)
 
 timer_label = tk.Label(root, text="00:00", font=("Consolas", 24, "bold"), fg="#ff3d00", bg="#1e1e1e")
@@ -540,8 +577,10 @@ record_btn.pack(side=tk.LEFT, padx=5)
 pause_btn = tk.Button(btn_frame, text="⏸️ Pause", font=("Segoe UI", 11, "bold"), fg="#ffffff", bg="#555555", activeforeground="#ffffff", activebackground="#777777", border=0, state="disabled", cursor="hand2", width=14, height=2, command=toggle_pause)
 pause_btn.pack(side=tk.LEFT, padx=5)
 
-status_label = tk.Label(root, text="Ready to record", font=("Segoe UI", 9, "italic"), fg="#888888", bg="#1e1e1e")
+status_label = tk.Label(root, text="Booting acceleration tracking...", font=("Segoe UI", 9, "italic"), fg="#888888", bg="#1e1e1e")
 status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
 
 if __name__ == "__main__":
+    gpu_found = get_gpu_type()
+    root.after(100, lambda: update_status(f"System Optimized: Dedicated {gpu_found} Engine active"))
     root.mainloop()
